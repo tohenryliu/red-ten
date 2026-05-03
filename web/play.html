@@ -689,62 +689,11 @@ function handleMsg(msg) {
       break;
 
     case 'game_event':
-      if (showingHandEnd) hideHandEndOverlay();
-      gameEvents.push(msg.event);
-      gameSnap = msg.event.snap;
-      if (msg.event.player != null) lastActor = msg.event.player;
-      evLog.push(msg.event.desc.replace(/\bP([0-5])\b/g, (_, n) => pLabel(+n)));
-      if (evLog.length > 60) evLog.shift();
-
-      // Trigger card fly / pass animations
-      const ev = msg.event;
-      if ((ev.kind === 'lead' || ev.kind === 'action') && ev.move && ev.player != null) {
-        if (ev.move.pass) {
-          showPassBadge(ev.player);
-        } else if (ev.move.cards && ev.move.cards.length) {
-          animateCardPlay(ev.player, ev.move.cards);
-          if (ev.move.bomb) { Sound.bomb(); shakeScreen(); } else Sound.card();
-        }
-      }
-      if (ev.kind === 'trick_end') Sound.trickEnd();
-
-      // AI personality speech bubbles
-      if (ev.player != null) {
-        if (ev.kind === 'lead' || ev.kind === 'action') {
-          // Priority: flush any queued hand_end chatter, speak immediately
-          if (ev.move?.bomb)      showAIBubble(ev.player, 'bomb',      400, true);
-          else if (ev.move?.pass) showAIBubble(ev.player, 'pass',      400, false);
-          else if (ev.move)       showAIBubble(ev.player, 'play',      400, false);
-        } else if (ev.kind === 'trick_end' && ev.winner != null) {
-          showAIBubble(ev.winner, 'trick_win', 600, false);
-        }
-      }
-      if (ev.kind === 'hand_end' && ev.result) {
-        const redSeats = new Set(ev.result.red || []);
-        const redWon = (ev.result.team_pts?.RED ?? 0) > (ev.result.team_pts?.NON_RED ?? 0);
-        // Stagger visuals 1200 ms apart; TTS queue plays each voice after the previous finishes
-        let slot = 0;
-        for (let p = 0; p < 6; p++) {
-          if (p === mySeat) continue;
-          const won = redSeats.has(p) ? redWon : !redWon;
-          showAIBubble(p, won ? 'hand_win' : 'hand_lose', 800 + slot * 1200);
-          slot++;
-        }
-      }
-
-      renderGame();
-      if (msg.event.kind === 'hand_end' && msg.event.result) {
-        Sound.handEnd();
-        pendingResult = msg.event.result;
-        pendingSnap = msg.event.snap;
-        showMoGongDisplay(msg.event.result);
-      }
+      enqueueGameEvent(msg.event);
       break;
 
     case 'your_turn':
-      Sound.yourTurn();
-      myTurnMoves = msg.legal_moves;
-      showMovePicker(msg.legal_moves);
+      enqueueGameEvent({ _isYourTurn: true, legal_moves: msg.legal_moves });
       break;
 
     case 'game_over':
@@ -1444,34 +1393,63 @@ const TRIGGER_MOD = {
   hand_lose: { pitch: -0.25, rate: -0.1  },
 };
 
-// Audio playback — pre-recorded MP3s with web speech fallback for missing files
+// Audio playback — pre-recorded MP3s with web speech fallback for missing files.
+// Queue: clips play one at a time; each waits for the previous to finish.
+// Bombs use interrupt=true to flush the queue and play immediately.
+const _audioQueue = [];
 let _currentAudio = null;
+let _isSpeaking   = false;
 
 function _stopAudio() {
+  _audioQueue.length = 0;
+  _isSpeaking = false;
   if (_currentAudio) { _currentAudio.pause(); _currentAudio = null; }
   if (window.speechSynthesis) window.speechSynthesis.cancel();
 }
 
+function _playNext() {
+  if (_isSpeaking || _audioQueue.length === 0) {
+    if (!_isSpeaking) _maybeNextGameEvent(); // advance event queue when audio drains
+    return;
+  }
+  _isSpeaking = true;
+  _audioQueue.shift()();
+}
+
 function speakBubble(char, trigger, idx, interrupt = false, voice = null) {
-  if (interrupt) _stopAudio();
+  if (interrupt) {
+    _stopAudio();
+    _isSpeaking = true;
+    _doSpeak(char, trigger, idx, voice);
+  } else {
+    _audioQueue.push(() => _doSpeak(char, trigger, idx, voice));
+    _playNext();
+  }
+}
+
+function _doSpeak(char, trigger, idx, voice) {
   if (char.slug) {
     const audio = new Audio(`/audio/chars/${char.slug}_${trigger}_${idx}.mp3`);
     _currentAudio = audio;
-    audio.onended = () => { if (_currentAudio === audio) _currentAudio = null; };
-    audio.play().catch(() => _speakWebSpeech(char, char[trigger][idx], trigger, voice));
+    const _audioDone = () => { _currentAudio = null; _isSpeaking = false; _playNext(); };
+    audio.onended = _audioDone;
+    audio.onerror = _audioDone;
+    audio.play().catch(() => { _currentAudio = null; _speakWebSpeech(char, char[trigger][idx], trigger, voice); });
     return;
   }
   _speakWebSpeech(char, char[trigger][idx], trigger, voice);
 }
 
 function _speakWebSpeech(char, text, trigger, voice = null) {
-  if (!window.speechSynthesis) return;
+  if (!window.speechSynthesis) { _isSpeaking = false; _playNext(); return; }
   const utter = new SpeechSynthesisUtterance(text);
   utter.lang = char.lang;
   const mod = TRIGGER_MOD[trigger] || { pitch: 0, rate: 0 };
   utter.pitch = Math.max(0.1, Math.min(2, (char.pitch ?? 1) + mod.pitch));
   utter.rate  = Math.max(0.1, Math.min(2, (char.rate  ?? 1) + mod.rate));
   if (voice) utter.voice = voice;
+  utter.onend   = () => { _isSpeaking = false; _playNext(); };
+  utter.onerror = () => { _isSpeaking = false; _playNext(); };
   window.speechSynthesis.speak(utter);
 }
 
@@ -1480,27 +1458,105 @@ const _bubbleTimers = {};
 function showAIBubble(seat, trigger, delay = 0, interrupt = false) {
   if (seat === mySeat) return;
   if (!roomSeats[seat] || roomSeats[seat].mode !== 'ai') return;
+  const seatEl = document.getElementById('gseat-' + seat);
+  if (!seatEl) return;
+  const char = AI_CHARACTER_POOL[seatCharacters[seat]];
+  if (!char) return;
+  const lines = char[trigger];
+  if (!lines?.length) return;
+  const idx  = Math.floor(Math.random() * lines.length);
+  const text = lines[idx];
+
+  // Queue audio immediately so the event gate sees it before advancing.
+  speakBubble(char, trigger, idx, interrupt, _seatVoices[seat]);
+
+  // Visual bubble appears after delay (aesthetic only — audio already running).
   clearTimeout(_bubbleTimers[seat]);
   _bubbleTimers[seat] = setTimeout(() => {
-    const seatEl = document.getElementById('gseat-' + seat);
-    if (!seatEl) return;
-    const char = AI_CHARACTER_POOL[seatCharacters[seat]];
-    if (!char) return;
-    const lines = char[trigger];
-    if (!lines?.length) return;
-    const idx  = Math.floor(Math.random() * lines.length);
-    const text = lines[idx];
-
     seatEl.querySelector('.ai-bubble')?.remove();
     const bubble = document.createElement('div');
     bubble.className = 'ai-bubble';
     bubble.textContent = text;
     seatEl.appendChild(bubble);
-
-    speakBubble(char, trigger, idx, interrupt, _seatVoices[seat]);
-
     setTimeout(() => seatEl.querySelector('.ai-bubble')?.remove(), 3500);
   }, delay);
+}
+
+// ── Game event queue ──────────────────────────────────────────────────────────
+// Buffers game_event and your_turn messages; processes one at a time, waiting
+// for each event's audio to finish before rendering the next.
+const _gameEventQueue = [];
+
+function enqueueGameEvent(item) {
+  _gameEventQueue.push(item);
+  _maybeNextGameEvent();
+}
+
+function _maybeNextGameEvent() {
+  if (_isSpeaking || _audioQueue.length > 0 || _gameEventQueue.length === 0) return;
+  const item = _gameEventQueue.shift();
+
+  if (item._isYourTurn) {
+    Sound.yourTurn();
+    myTurnMoves = item.legal_moves;
+    showMovePicker(item.legal_moves);
+    setTimeout(_maybeNextGameEvent, 100);
+    return;
+  }
+
+  _renderGameEvent(item);
+  if (!_isSpeaking && _audioQueue.length === 0) {
+    setTimeout(_maybeNextGameEvent, 150); // no audio: short pause then advance
+  }
+  // With audio: _playNext → _maybeNextGameEvent when the clip finishes
+}
+
+function _renderGameEvent(ev) {
+  if (showingHandEnd) hideHandEndOverlay();
+  gameEvents.push(ev);
+  gameSnap = ev.snap;
+  if (ev.player != null) lastActor = ev.player;
+  evLog.push(ev.desc.replace(/\bP([0-5])\b/g, (_, n) => pLabel(+n)));
+  if (evLog.length > 60) evLog.shift();
+
+  if ((ev.kind === 'lead' || ev.kind === 'action') && ev.move && ev.player != null) {
+    if (ev.move.pass) {
+      showPassBadge(ev.player);
+    } else if (ev.move.cards && ev.move.cards.length) {
+      animateCardPlay(ev.player, ev.move.cards);
+      if (ev.move.bomb) { Sound.bomb(); shakeScreen(); } else Sound.card();
+    }
+  }
+  if (ev.kind === 'trick_end') Sound.trickEnd();
+
+  if (ev.player != null) {
+    if (ev.kind === 'lead' || ev.kind === 'action') {
+      if (ev.move?.bomb)      showAIBubble(ev.player, 'bomb',      200, true);
+      else if (ev.move?.pass) showAIBubble(ev.player, 'pass',      200, false);
+      else if (ev.move)       showAIBubble(ev.player, 'play',      200, false);
+    } else if (ev.kind === 'trick_end' && ev.winner != null) {
+      showAIBubble(ev.winner, 'trick_win', 300, false);
+    }
+  }
+  if (ev.kind === 'hand_end' && ev.result) {
+    const redSeats = new Set(ev.result.red || []);
+    const redWon = (ev.result.team_pts?.RED ?? 0) > (ev.result.team_pts?.NON_RED ?? 0);
+    let slot = 0;
+    for (let p = 0; p < 6; p++) {
+      if (p === mySeat) continue;
+      const won = redSeats.has(p) ? redWon : !redWon;
+      showAIBubble(p, won ? 'hand_win' : 'hand_lose', slot * 300);
+      slot++;
+    }
+  }
+
+  renderGame();
+  if (ev.kind === 'hand_end' && ev.result) {
+    Sound.handEnd();
+    pendingResult = ev.result;
+    pendingSnap   = ev.snap;
+    showMoGongDisplay(ev.result);
+  }
 }
 
 // ── Resize ────────────────────────────────────────────────────────────────────
