@@ -1393,6 +1393,7 @@ const AI_CHARACTER_POOL = [
 ];
 
 let seatCharacters = [];
+let _seatVoices = [];  // one resolved SpeechSynthesisVoice per seat, fixed at game-start
 
 // TODO: add in-game toggle to switch between Chinese-only and full pool
 const CHINESE_ONLY = true;
@@ -1401,6 +1402,19 @@ const CHINESE_INDICES = AI_CHARACTER_POOL
   .filter(({ c }) => c.lang.startsWith('zh') || c.lang.startsWith('cmn'))
   .map(({ i }) => i);
 
+function _resolveVoice(char) {
+  const voices = window.speechSynthesis?.getVoices() || [];
+  const lang5 = char.lang.slice(0, 5);
+  const lang2 = char.lang.slice(0, 2);
+  return (
+    voices.find(v => v.lang.startsWith(lang5) && /enhanced|premium|natural/i.test(v.name)) ||
+    voices.find(v => v.lang === char.lang) ||
+    voices.find(v => v.lang.startsWith(lang5)) ||
+    voices.find(v => v.lang.startsWith(lang2)) ||
+    null
+  );
+}
+
 function assignCharacters() {
   const indices = [...(CHINESE_ONLY ? CHINESE_INDICES : AI_CHARACTER_POOL.map((_, i) => i))];
   for (let i = indices.length - 1; i > 0; i--) {
@@ -1408,12 +1422,15 @@ function assignCharacters() {
     [indices[i], indices[j]] = [indices[j], indices[i]];
   }
   seatCharacters = indices.slice(0, 6);
+  _seatVoices = seatCharacters.map(ci => _resolveVoice(AI_CHARACTER_POOL[ci]));
 }
 
-let _ttsVoices = [];
 if (window.speechSynthesis) {
   window.speechSynthesis.onvoiceschanged = () => {
-    _ttsVoices = window.speechSynthesis.getVoices();
+    // Re-resolve voices for already-assigned seats so they lock in on the same voice going forward.
+    if (seatCharacters.length) {
+      _seatVoices = seatCharacters.map(ci => _resolveVoice(AI_CHARACTER_POOL[ci]));
+    }
   };
 }
 
@@ -1435,33 +1452,26 @@ function _stopAudio() {
   if (window.speechSynthesis) window.speechSynthesis.cancel();
 }
 
-function speakBubble(char, trigger, idx, interrupt = false) {
+function speakBubble(char, trigger, idx, interrupt = false, voice = null) {
   if (interrupt) _stopAudio();
   if (char.slug) {
     const audio = new Audio(`/audio/chars/${char.slug}_${trigger}_${idx}.mp3`);
     _currentAudio = audio;
     audio.onended = () => { if (_currentAudio === audio) _currentAudio = null; };
-    audio.play().catch(() => _speakWebSpeech(char, char[trigger][idx], trigger));
+    audio.play().catch(() => _speakWebSpeech(char, char[trigger][idx], trigger, voice));
     return;
   }
-  _speakWebSpeech(char, char[trigger][idx], trigger);
+  _speakWebSpeech(char, char[trigger][idx], trigger, voice);
 }
 
-function _speakWebSpeech(char, text, trigger) {
+function _speakWebSpeech(char, text, trigger, voice = null) {
   if (!window.speechSynthesis) return;
   const utter = new SpeechSynthesisUtterance(text);
   utter.lang = char.lang;
   const mod = TRIGGER_MOD[trigger] || { pitch: 0, rate: 0 };
   utter.pitch = Math.max(0.1, Math.min(2, (char.pitch ?? 1) + mod.pitch));
   utter.rate  = Math.max(0.1, Math.min(2, (char.rate  ?? 1) + mod.rate));
-  const lang5 = char.lang.slice(0, 5);
-  const lang2 = char.lang.slice(0, 2);
-  const match =
-    _ttsVoices.find(v => v.lang.startsWith(lang5) && /enhanced|premium|natural/i.test(v.name)) ||
-    _ttsVoices.find(v => v.lang === char.lang) ||
-    _ttsVoices.find(v => v.lang.startsWith(lang5)) ||
-    _ttsVoices.find(v => v.lang.startsWith(lang2));
-  if (match) utter.voice = match;
+  if (voice) utter.voice = voice;
   window.speechSynthesis.speak(utter);
 }
 
@@ -1487,7 +1497,7 @@ function showAIBubble(seat, trigger, delay = 0, interrupt = false) {
     bubble.textContent = text;
     seatEl.appendChild(bubble);
 
-    speakBubble(char, trigger, idx, interrupt);
+    speakBubble(char, trigger, idx, interrupt, _seatVoices[seat]);
 
     setTimeout(() => seatEl.querySelector('.ai-bubble')?.remove(), 3500);
   }, delay);
